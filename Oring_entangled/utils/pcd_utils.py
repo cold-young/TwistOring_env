@@ -13,20 +13,23 @@ from omni.isaac.core.utils.prims import (
 )
 from omni.isaac.core.prims import XFormPrimView
 import omni.usd
-from pxr import UsdGeom, PhysxSchema, Gf, Usd, UsdGeom, UsdShade
+from pxr import UsdGeom, PhysxSchema, Gf, Usd, UsdShade
 import numpy as np
 import torch
 # from ..models import PCN as Model
 
 # JH model
 # from omni.isaac.orbit_envs.soft.Oring_entangled.models.meta_modules import PCNNeuralProcessImplicit3DHypernet as Model
-from ..models.meta_modules import PCNNeuralProcessImplicit3DHypernet as Model
+from ..models.meta_modules import NeuralProcessImplicit3DHypernet as Model
+from ..models.meta_modules import SDFDecoder as SDFDecoder
 # from ..models.pcn_512 import PCN  # PCN
 
 import omni.replicator.core as rep
 
 import omni.kit.app
 import open3d as o3d
+
+import yaml
 
 import os
 import random
@@ -41,6 +44,8 @@ class PointCloudHandle():
         
         self.camera_path = []
 
+        self.camera_sensors = []
+
         for i, prim_path in enumerate(self.deform_path):
             self.deform_prim.append(get_prim_at_path(prim_path))
             self.camera_path.append(f"/World/envs/env_{i}/oring_env/vision_sensor")
@@ -54,29 +59,49 @@ class PointCloudHandle():
 
         # latent vector extract
         # self.model = PCN().to("cuda:0")
-        self.model = Model().to("cuda:0")
+        with open(self.root + "/Oring_entangled/models/configs/oringrl_ae_skip.yaml", 'r') as f:
+            cfg = yaml.safe_load(f)
+
+        self.model = Model(cfg['model']).to("cuda:0")
 
         # self.model.load_state_dict(torch.load(self.root + "/Oring_entangled/models/checkpoint/best_l1_cd.pth"))
         # self.model.load_state_dict(torch.load(self.root + "/Oring_entangled/models/checkpoint/checkpoint_400.pth"))
-        self.model.load_state_dict(torch.load(self.root + "/Oring_entangled/models/checkpoint/model_epoch_0300.pth"))
+        self.model.load_state_dict(torch.load(self.root + "/Oring_entangled/models/checkpoint/oringrl_ae_skip.pth"))
 
+        self.sdfdecoder = SDFDecoder(self.model).to("cuda:0")
 
+    def removeAPIs(self):
+        for prim_path in self.deform_path:
+            success = omni.kit.commands.execute(
+            "RemoveDeformableBodyComponent",
+            prim_path=prim_path)
+
+        for deform_prim in self.deform_prim:
+            deform_prim.RemoveAPI(PhysxSchema.PhysxDeformableBodyAPI)
+     
     def initialize(self):
+        del self.deform_prim
         self.deform_prim = []
+
+        del self.deformable_body
         self.deformable_body = []
+
         for prim_path in self.deform_path:
             self.deform_prim.append(get_prim_at_path(prim_path))
         for deform_body in self.deform_prim:
             self.deformable_body.append(PhysxSchema.PhysxDeformableBodyAPI(deform_body))
         
     def visualizer_setup(self, color=(1, 0, 0), size=0.1):
+        self.points = []
+
         for i, deform_body in enumerate(self.deformable_body):
-            N, _ = np.array(deform_body.GetCollisionPointsAttr().Get()).shape
+            # N, _ = np.array(deform_body.GetCollisionPointsAttr().Get()).shape
             # N = 10
+            N = 1024
             point_list = np.zeros([N, 3])
             sizes = size * np.ones(N)
             stage = omni.usd.get_context().get_stage()
-            point = UsdGeom.Points.Define(stage, "/World/Points/" + f"Pcd_{i}")
+            point = UsdGeom.Points.Define(stage, f"/World/envs/env_{i}/oring_env/" + f"Pcd_{i}")
             point.CreatePointsAttr().Set(point_list)
             point.CreateWidthsAttr().Set(sizes)
             point.CreateDisplayColorPrimvar("constant").Set([color])
@@ -87,12 +112,12 @@ class PointCloudHandle():
     # fully observable
     def get_deform_point(self, rigid_poles, render: bool = False, normalize: bool = True):
         """Extract point clouds """
-        pcds = []
+        pcds = [] ## 
         for i, deform_body in enumerate(self.deformable_body):
             local_collision_point = (np.array(deform_body.GetCollisionPointsAttr().Get())) 
             vertices = np.array(local_collision_point)
             vertices_tf_row_major = np.pad(vertices, ((0, 0), (0, 1)), constant_values=1.0)
-            relative_tf_column_major = get_relative_transform(self.deform_prim[i], get_prim_at_path("/World"))
+            relative_tf_column_major = get_relative_transform(self.deform_prim[i], get_prim_at_path("/World/envs/env_{}".format(i)))
             relative_tf_row_major = np.transpose(relative_tf_column_major)
             points_in_relative_coord = vertices_tf_row_major @ relative_tf_row_major
             pcd = points_in_relative_coord[:, :-1]
@@ -114,6 +139,15 @@ class PointCloudHandle():
     # fully observable
     def set_camera_initailize(self):
         """Extract point clouds """
+        if len(self.camera_sensors) > 0:
+            for annotator in self.camera_sensors:
+                rps = annotator._render_products
+                annotator.detach(rps)
+                # while annotator.is_attached:
+                #     rp = annotator.get_node()
+                #     annotator.detach([rp])
+                del annotator
+
         self.camera_sensors = []
         for camera_path in self.camera_path:
             rp = rep.create.render_product(camera_path, (1024, 1024))
@@ -159,7 +193,7 @@ class PointCloudHandle():
         local_collision_point = (np.array(self.deformable_body[num_env].GetCollisionPointsAttr().Get())) 
         vertices = np.array(local_collision_point)
         vertices_tf_row_major = np.pad(vertices, ((0, 0), (0, 1)), constant_values=1.0)
-        relative_tf_column_major = get_relative_transform(self.deform_prim[num_env], get_prim_at_path("/World"))
+        relative_tf_column_major = get_relative_transform(self.deform_prim[num_env], get_prim_at_path("/World/envs/env_{}".format(num_env)))
         relative_tf_row_major = np.transpose(relative_tf_column_major)
         points_in_relative_coord = vertices_tf_row_major @ relative_tf_row_major
         pcd = points_in_relative_coord[:, :-1]
@@ -184,7 +218,7 @@ class PointCloudHandle():
             norm_pcd = (pcd - mean)/scale_factor
 
             # related mean 
-            related_mean = torch.as_tensor(mean) - rigid_poles[i]
+            related_mean = torch.as_tensor(mean) - rigid_poles[i] 
             denorm_factors.append(np.hstack((related_mean, scale_factor)))
             #
             norm_pcds.append(norm_pcd)
@@ -199,27 +233,39 @@ class PointCloudHandle():
         sizes = 0.1 * np.ones(1024)
 
         for i, norm_pcd in enumerate(norm_pcds):    
-            denorm_pcd = norm_pcd.cpu().detach().numpy() * denorm_factors[i][-1] + denorm_factors[i][:3]
+            if norm_pcd is None:
+                return
+            rigid_pole_pos = np.array([0.,1.5,0.3])
+            denorm_pcd = norm_pcd * denorm_factors[i][-1] + denorm_factors[i][:3] + rigid_pole_pos
             # denorm_pcd[0] /= 2 
-            denorm_pcds.append(denorm_pcd[0])
+            denorm_pcds.append(denorm_pcd)
 
         if render:             
-            point_list = np.zeros([1024, 3])
             for i, point in enumerate(self.points):
+                point_list = self.random_sample(denorm_pcds[i], 1024)
                 point.CreatePointsAttr().Set(point_list)
                 point.CreateWidthsAttr().Set(sizes)
                 point.GetPointsAttr().Set(denorm_pcds[i])  # vis
 
-        # return denorm_pcds
+        return denorm_pcds
 
     def get_decoder_pcds(self, norm_pcds, denorm_factors, decoder: bool = False):
         gen_pcds = []
         for norm_pcd in norm_pcds:
-            gen_pcd = self.model.forward(norm_pcd)#PCN
+            gen_pcd = self.model.forward(norm_pcd)
             gen_pcds.append(gen_pcd)
 
         if decoder:
             self.set_denormalize(gen_pcds, denorm_factors)
+
+    def render_decoded_pcds(self, latent_vectors, scale_factors):
+        gen_pcds = []
+        latent_vectors = latent_vectors.clone().detach().to("cuda:0")
+        for i in range(latent_vectors.shape[0]):
+            pcd = self.sdfdecoder.decode(torch.unsqueeze(latent_vectors[i], dim=0))
+            gen_pcds.append(pcd)
+
+        self.set_denormalize(gen_pcds, scale_factors.numpy())
 
     def get_latent_vetors(self, norm_pcds):
         """
@@ -234,10 +280,10 @@ class PointCloudHandle():
         #     latent_vector = self.model.encode(norm_pcd.unsqueeze())
         #     latent_vectors.append(latent_vector)
         # return torch.cat(latent_vectors, 0)
-    
-        # x, y, z stack num_envs*N*3 
-
-        latent_vectors = self.model.encode(torch.as_tensor(norm_pcds)) # need to check
+        norm_pcds = np.array(norm_pcds)
+        # x, y, z stack num_envs*N*3 .cpu().numpy()
+        with torch.no_grad():
+            latent_vectors = self.model.encode(torch.as_tensor(norm_pcds, dtype=torch.float).to("cuda:0")).clone().detach() # need to check
         return latent_vectors
     
     def set_off_render(self):

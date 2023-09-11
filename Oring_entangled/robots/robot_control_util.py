@@ -32,10 +32,12 @@ class RobotUtils():
         # self.collision_prim = []
         self.attach_path = []
         self.twist_trig_path = []
+        self.pole_trig_path = []
 
         for i in range(self.num_envs):
             self.deform_path.append(f"/World/envs/env_{i}/oring_env/oring_01_05/oring")
             self.twist_trig_path.append(f"/World/envs/env_{i}/oring_env/twist_check/trigger")
+            self.pole_trig_path.append(f"/World/envs/env_{i}/rigid_pole/invisible/trigger")
 
             self.trigger_path.append(f"/World/envs/env_{i}/Robot/panda_hand/geometry/trigger")
             self.collision_path.append(f"/World/envs/env_{i}/Robot/panda_hand/geometry/albano")
@@ -68,6 +70,10 @@ class RobotUtils():
         """
         for i, _ in enumerate(self.deform_path):
             self.grip_tip.enable_collision(indices=[i])
+    
+    def set_manual_grip2(self):
+        for i, _ in enumerate(self.deform_path):
+            self.grip_tip.disable_collision(indices=[i])
 
     def set_attach(self, rigid, deform):
         """
@@ -94,34 +100,58 @@ class RobotUtils():
         """get collision check between oring and trigger and set grasp"""
         self.coll_check = []
         self.oring_no_fall = []
+        self.pole_check = []
         for i in range(self.num_envs):
               
-            rigid_prim = get_current_stage().GetPrimAtPath(self.twist_trig_path[i])
-            rigid_body = UsdGeom.Mesh(rigid_prim)
-            local_collision_point = (np.array(rigid_body.GetPointsAttr().Get()))
+            twist_trig_prim = get_current_stage().GetPrimAtPath(self.twist_trig_path[i])
+            twist_trig_mesh = UsdGeom.Mesh(twist_trig_prim)
+            twist_trig_local_collision_point = (np.array(twist_trig_mesh.GetPointsAttr().Get()))
             
-            vertices = np.array(local_collision_point)
+            vertices = np.array(twist_trig_local_collision_point)
             vertices_tf_row_major = np.pad(vertices, ((0, 0), (0, 1)), constant_values=1.0)
             relative_tf_column_major = get_relative_transform(get_prim_at_path(self.twist_trig_path[i]), 
-                                                            get_prim_at_path('/World'))
+                                                            get_prim_at_path("/World/envs/env_{}".format(i)))
             relative_tf_row_major = np.transpose(relative_tf_column_major)
 
             points_in_relative_coord = vertices_tf_row_major @ relative_tf_row_major
             points_in_meters = points_in_relative_coord[:, :-1]
 
+
             # make bounding box
-            rigid = t.PointCloud(points_in_meters)
-            a = rigid.bounding_box
+            twist_trig_pc = t.PointCloud(points_in_meters)
+            twist_trig_boundingbox = twist_trig_pc.bounding_box
+
+
+            goal_trig_prim = get_current_stage().GetPrimAtPath(self.pole_trig_path[i])
+            goal_trig_mesh = UsdGeom.Mesh(goal_trig_prim)
+            goal_trig_local_collision_point = (np.array(goal_trig_mesh.GetPointsAttr().Get()))
             
-            contact_check = not any(item == True for item in a.contains(deform_points[i]))
+            vertices = np.array(goal_trig_local_collision_point)
+            vertices_tf_row_major = np.pad(vertices, ((0, 0), (0, 1)), constant_values=1.0)
+            relative_tf_column_major = get_relative_transform(get_prim_at_path(self.pole_trig_path[i]), 
+                                                            get_prim_at_path("/World/envs/env_{}".format(i)))
+            relative_tf_row_major = np.transpose(relative_tf_column_major)
+
+            points_in_relative_coord = vertices_tf_row_major @ relative_tf_row_major
+            points_in_meters = points_in_relative_coord[:, :-1]
+
+
+            # make bounding box
+            goal_trig_pc = t.PointCloud(points_in_meters)
+            goal_trig_boundingbox = goal_trig_pc.bounding_box
+            
+            contact_check = not any(item == True for item in twist_trig_boundingbox.contains(deform_points[i]))
             self.coll_check.append(torch.as_tensor(contact_check))
+
+            pole_check = any(item == True for item in goal_trig_boundingbox.contains(deform_points[i]))
+            self.pole_check.append(torch.as_tensor(pole_check))
             
             # check oring center in trigger 
             raw_pcds_array = np.stack(deform_points[i])  # Convert list to numpy array
             # raw_pcds_tensor = torch.from_numpy(raw_pcds_array)  # Convert numpy array to tensor
             oring_mean_point = np.mean(raw_pcds_array, axis=0) 
 
-            oring_inner_check = a.contains([oring_mean_point])
+            oring_inner_check = twist_trig_boundingbox.contains([oring_mean_point])
             self.oring_no_fall.append(torch.as_tensor(oring_inner_check))
 
-        return torch.as_tensor(self.coll_check, dtype=float), torch.as_tensor(self.oring_no_fall, dtype=float).reshape(self.num_envs)
+        return torch.as_tensor(self.coll_check, dtype=float), torch.as_tensor(self.pole_check, dtype=float), torch.as_tensor(self.oring_no_fall, dtype=float).reshape(self.num_envs)

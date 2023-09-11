@@ -5,10 +5,7 @@ import torch
 from torch import nn
 from collections import OrderedDict
 import omni.isaac.orbit_envs.soft.Oring_entangled.models.modules as modules
-# import os
-# print(os.getcwd())
-# from IPython import embed; embed()
-# import modules
+import omni.isaac.orbit_envs.soft.Oring_entangled.models.sdf_meshing as sdf_meshing
 
 
 class HyperNetwork(nn.Module):
@@ -134,42 +131,60 @@ class ConvolutionalNeuralProcessImplicit2DHypernet(nn.Module):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-class PCNNeuralProcessImplicit3DHypernet(nn.Module): # chan pcn encoder / model load
-    def __init__(self):
+class PCNNeuralProcessImplicit3DHypernet(nn.Module):
+    def __init__(self, type='sine', is_vae=False, latent_skip=False):
         super().__init__()
-        latent_dim = 256
+        self.latent_dim = 64
 
-        self.hypo_net =  modules.SingleBVPNet(type='sine', in_features=3)
-        self.encoder = modules.PCNEncoder()
-        self.hyper_net = HyperNetwork(hyper_in_features=latent_dim, hyper_hidden_layers=3, hyper_hidden_features=256, hypo_module=self.hypo_net)
+        self.is_vae = is_vae
+
+        self.hypo_net =  modules.SingleBVPNet(type=type, in_features=3, hidden_features=64, num_hidden_layers=3, latent_in=self.latent_dim if latent_skip else 0) # sine or relu
+        self.encoder = modules.PCNEncoder(latent_dim=self.latent_dim, is_vae=is_vae)
+        self.hyper_net = HyperNetwork(hyper_in_features=self.latent_dim, hyper_hidden_layers=3, hyper_hidden_features=128, hypo_module=self.hypo_net)
         
         print(self)
 
     def forward(self, model_input):
-        if model_input.get('embedding', None) is None:
-            embedding = self.encoder(model_input['partial'])
+        if model_input.get('partial_embedding', None) is None:
+            partial_mu, partial_logvar = self.encoder(model_input['partial'])
         else:
-            embedding = model_input['partial']
+            partial_mu = model_input['partial_mu']
+            partial_logvar = model_input['partial_logvar']
             
 
-        if model_input.get('complete', None) is None:
-            complete_embedding = None
+        if model_input.get('complete_embedding', None) is None:
+            complete_mu, complete_logvar = self.encoder(model_input['complete'])
         else:
-            complete_embedding = self.encoder(model_input['complete'])
+            complete_mu = model_input['partial_mu']
+            complete_logvar = model_input['partial_logvar']
         
-        hypo_params = self.hyper_net(embedding)
+        if self.is_vae and self.training:
+            partial_embedding = self.reparameterize(partial_mu, partial_logvar)
+            complete_embedding = self.reparameterize(complete_mu, complete_logvar)
+        else:
+            partial_embedding = partial_mu
+            complete_embedding = complete_mu
+        
+        model_input['partial_embedding'] = partial_embedding
+        model_input['complete_embedding'] = complete_embedding
+
+        # hypo_params = self.hyper_net(partial_embedding)
+        hypo_params = self.hyper_net(complete_embedding)
         
         model_output = self.hypo_net(model_input, params=hypo_params)
 
-        return {'model_in': model_output['model_in'], 'model_out': model_output['model_out'], 'latent_vec': embedding, 'hypo_params': hypo_params, 'complete_latent_vec': complete_embedding}
-        # output sdf ? sampled sdf 
+        return {'model_in': model_output['model_in'], 'model_out': model_output['model_out'], 'partial_latent_vec': partial_embedding, 'partial_mu': partial_mu, 'partial_logvar': partial_logvar, 'hypo_params': hypo_params, 'complete_latent_vec': complete_embedding, 'complete_mu': complete_mu, 'complete_logvar':complete_logvar}
 
     def encode(self, xyz):
-    
-        return self.encoder(xyz) # new axis for batch?
+        mu, logvar = self.encoder(xyz) # new axis for batch?
+        if self.is_vae and self.training:
+            embedding = self.reparameterize(mu, logvar)
+        else:
+            embedding = mu
+        return embedding
     
     def get_hypo_net_weights(self, model_input):
-        embedding = self.encoder(model_input['partial'])
+        embedding, _ = self.encoder(model_input['partial'])
         hypo_params = self.hyper_net(embedding)
         return hypo_params, embedding
 
@@ -178,6 +193,159 @@ class PCNNeuralProcessImplicit3DHypernet(nn.Module): # chan pcn encoder / model 
             param.requires_grad = False
         for param in self.encoder.parameters():
             param.requires_grad = False
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+    
+
+class NeuralProcessImplicit3DHypernet(nn.Module):
+    def __init__(self, model_cfg):
+        super().__init__()
+        self.cfg = model_cfg
+        self.latent_dim = model_cfg['latent_dim']
+        self.is_vae = model_cfg['vae']
+        self.encoder_type = model_cfg['encoder']['type']
+        self.skip = model_cfg['skip']
+
+        self.hypo_net =  modules.SingleBVPNet(type=self.cfg['hyponet']['type'], in_features=3, hidden_features=self.cfg['hyponet']['hidden_features'], num_hidden_layers=self.cfg['hyponet']['hidden_layers'], latent_in=self.latent_dim if self.skip else 0) # sine or relu
+        if self.encoder_type == 'pcn': 
+            self.encoder = modules.PCNEncoder(latent_dim=self.latent_dim, is_vae=self.is_vae)
+        elif self.encoder_type == 'pointnet':
+            self.encoder = modules.PointNetPPEncoder(latent_dim = self.latent_dim, normal_channel=False, is_vae=self.is_vae)
+        else:
+            raise NotImplementedError
+        self.hyper_net = HyperNetwork(hyper_in_features=self.latent_dim, hyper_hidden_layers=self.cfg['decoder']['hidden_layers'], hyper_hidden_features=self.cfg['decoder']['hidden_features'], hypo_module=self.hypo_net)
+        
+        print(self)
+
+    def forward(self, model_input):
+        if model_input.get('partial_embedding', None) is None:
+            partial_mu, partial_logvar = self.encoder(model_input['partial'])
+        else:
+            partial_mu = model_input['partial_mu']
+            partial_logvar = model_input['partial_logvar']
+            
+
+        if model_input.get('complete_embedding', None) is None:
+            complete_mu, complete_logvar = self.encoder(model_input['complete'])
+        else:
+            complete_mu = model_input['partial_mu']
+            complete_logvar = model_input['partial_logvar']
+        
+        if self.is_vae and self.training:
+            partial_embedding = self.reparameterize(partial_mu, partial_logvar)
+            complete_embedding = self.reparameterize(complete_mu, complete_logvar)
+        else:
+            partial_embedding = partial_mu
+            complete_embedding = complete_mu
+        
+        model_input['partial_latent_vec'] = partial_embedding
+        model_input['complete_latent_vec'] = complete_embedding
+
+        hypo_params = self.hyper_net(partial_embedding)
+        # hypo_params = self.hyper_net(complete_embedding)
+        
+        model_output = self.hypo_net(model_input, params=hypo_params)
+
+        return {'model_in': model_output['model_in'], 'model_out': model_output['model_out'], 'partial_latent_vec': partial_embedding, 'partial_mu': partial_mu, 'partial_logvar': partial_logvar, 'hypo_params': hypo_params, 'complete_latent_vec': complete_embedding, 'complete_mu': complete_mu, 'complete_logvar':complete_logvar}
+
+
+    def encode(self, xyz):
+        mu, logvar = self.encoder(xyz) # new axis for batch?
+        if self.is_vae and self.training:
+            embedding = self.reparameterize(mu, logvar)
+        else:
+            embedding = mu
+        return embedding
+    
+    def get_hypo_net_weights(self, model_input):
+        embedding, _ = self.encoder(model_input['partial'])
+        hypo_params = self.hyper_net(embedding)
+        return hypo_params, embedding
+
+    def freeze_hypernet(self):
+        for param in self.hyper_net.parameters():
+            param.requires_grad = False
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+
+
+
+
+
+class PointNetPPNeuralProcessImplicit3DHypernet(nn.Module):
+    def __init__(self, type='sine', is_vae=False, latent_skip=False):
+        super().__init__()
+        self.latent_dim = 128
+        self.is_vae = is_vae
+
+        self.hypo_net =  modules.SingleBVPNet(type=type, in_features=3, hidden_features=64, num_hidden_layers=3, latent_in=self.latent_dim if latent_skip else 0) # sine or relu
+        self.encoder = modules.PointNetPPEncoder(normal_channel=False, is_vae=is_vae)
+        self.hyper_net = HyperNetwork(hyper_in_features=self.latent_dim, hyper_hidden_layers=3, hyper_hidden_features=128, hypo_module=self.hypo_net)
+        
+        
+        print(self)
+
+    def forward(self, model_input):
+        if model_input.get('embedding', None) is None:
+            mu, logvar = self.encoder(model_input['partial'])
+        else:
+            mu = model_input['embedding']
+            logvar = model_input['logvar']
+            
+
+        if model_input.get('complete', None) is None:
+            complete_embedding = None
+        else:
+            complete_mu, complete_logvar = self.encoder(model_input['complete'])
+        
+        if self.is_vae and self.training:
+            embedding = self.reparameterize(mu, logvar)
+            complete_embedding = complete_mu
+        else:
+            embedding = mu
+            complete_embedding = complete_mu
+        
+        model_input['embedding'] = embedding
+
+        hypo_params = self.hyper_net(embedding)
+        
+        model_output = self.hypo_net(model_input, params=hypo_params)
+
+        return {'model_in': model_output['model_in'], 'model_out': model_output['model_out'], 'latent_vec': embedding, 'mu': mu, 'logvar': logvar, 'hypo_params': hypo_params, 'complete_latent_vec': complete_embedding, 'complete_mu': complete_mu, 'complete_logvar':complete_logvar}
+
+    def encode(self, xyz):
+        mu, logvar = self.encoder(xyz) # new axis for batch?
+        if self.is_vae and self.training:
+            embedding = self.reparameterize(mu, logvar)
+        else:
+            embedding = mu
+        return embedding
+    
+    def get_hypo_net_weights(self, model_input):
+        embedding, _ = self.encoder(model_input['partial'])
+        hypo_params = self.hyper_net(embedding)
+        return hypo_params, embedding
+
+    def freeze_hypernet(self):
+        for param in self.hyper_net.parameters():
+            param.requires_grad = False
+        for param in self.encoder.parameters():
+            param.requires_grad = False
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5*logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
 
 class PointCloudHypernet(nn.Module):
     def __init(self, in_features, out_features, partial_conv=False, hypo_type='sine'):
@@ -212,47 +380,30 @@ class PointCloudHypernet(nn.Module):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-class PointNetPPNeuralProcessImplicit3DHypernet(nn.Module): # chan pointnet encoder
-    def __init__(self):
+
+class SDFDecoder(torch.nn.Module):
+    def __init__(self, model=None):
         super().__init__()
-        latent_dim = 1024
-
-        self.hypo_net =  modules.SingleBVPNet(type='sine', in_features=3)
-        self.encoder = modules.PointNetPPEncoder(normal_channel=False)
-        self.hyper_net = HyperNetwork(hyper_in_features=latent_dim, hyper_hidden_layers=3, hyper_hidden_features=256, hypo_module=self.hypo_net)
-        
-        print(self)
-
-    def forward(self, model_input):
-        if model_input.get('embedding', None) is None:
-            embedding = self.encoder(model_input['partial'])
+        # Define the model.
+        if model is None:
+            self.model = PCNNeuralProcessImplicit3DHypernet()
+            self.model.cuda()
         else:
-            embedding = model_input['partial']
-
-        if model_input.get('complete', None) is None:
-            complete_embedding = None
-        else:
-            complete_embedding = self.encoder(model_input['partial'])
+            self.model = model
         
-        hypo_params = self.hyper_net(embedding)
-        
-        model_output = self.hypo_net(model_input, params=hypo_params)
-
-        return {'model_in': model_output['model_in'], 'model_out': model_output['model_out'], 'latent_vec': embedding, 'hypo_params': hypo_params, 'complete_latent_vec': complete_embedding}
-
-    def encode(self, xyz):
-        return self.encoder(xyz) # new axis for batch?
+    def forward(self, coords):
+        with torch.no_grad():
+            hypo_model_in = {'coords': coords, 'partial_latent_vec': self.embedding}
+            out = self.model.hypo_net(hypo_model_in, params=self.hypo_params)['model_out']
+        return out
     
-    def get_hypo_net_weights(self, model_input):
-        embedding = self.encoder(model_input['partial'])
-        hypo_params = self.hyper_net(embedding)
-        return hypo_params, embedding
-
-    def freeze_hypernet(self):
-        for param in self.hyper_net.parameters():
-            param.requires_grad = False
-        for param in self.encoder.parameters():
-            param.requires_grad = False
+    def decode(self, embedding):
+        with torch.no_grad():
+            self.eval()
+            self.hypo_params = self.model.hyper_net(embedding)
+            self.embedding = embedding
+            pcd = sdf_meshing.create_pcd(self, N=64)
+        return pcd
 
 ############################
 # Initialization schemes

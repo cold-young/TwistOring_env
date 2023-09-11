@@ -2,8 +2,6 @@ import torch
 from torch import nn
 from omni.isaac.orbit_envs.soft.Oring_entangled.models.torchmeta.modules import (MetaModule, MetaSequential)
 from omni.isaac.orbit_envs.soft.Oring_entangled.models.torchmeta.modules.utils import get_subdict
-from omni.isaac.orbit_envs.soft.Oring_entangled.models.modules import *
-
 import numpy as np
 from collections import OrderedDict
 import math
@@ -122,9 +120,10 @@ class SingleBVPNet(MetaModule):
     '''A canonical representation network for a BVP.'''
 
     def __init__(self, out_features=1, type='sine', in_features=2,
-                 mode='mlp', hidden_features=256, num_hidden_layers=3, **kwargs):
+                 mode='mlp', hidden_features=256, num_hidden_layers=3, latent_in=0, **kwargs):
         super().__init__()
         self.mode = mode
+        self.latent_in = latent_in
 
         if self.mode == 'rbf':
             self.rbf_layer = RBFLayer(in_features=in_features, out_features=kwargs.get('rbf_centers', 1024))
@@ -138,7 +137,7 @@ class SingleBVPNet(MetaModule):
 
         self.image_downsampling = ImageDownsampling(sidelength=kwargs.get('sidelength', None),
                                                     downsample=kwargs.get('downsample', False))
-        self.net = FCBlock(in_features=in_features, out_features=out_features, num_hidden_layers=num_hidden_layers,
+        self.net = FCBlock(in_features=in_features+self.latent_in, out_features=out_features, num_hidden_layers=num_hidden_layers,
                            hidden_features=hidden_features, outermost_linear=True, nonlinearity=type)
         # print(self)
 
@@ -149,6 +148,8 @@ class SingleBVPNet(MetaModule):
         # Enables us to compute gradients w.r.t. coordinates
         coords_org = model_input['coords'].clone().detach().requires_grad_(True)
         coords = coords_org
+        # if self.latent_in > 0:
+        #     latent = model_input['partial_embedding']
 
         # various input processing methods for different applications
         if self.image_downsampling.downsample:
@@ -158,12 +159,19 @@ class SingleBVPNet(MetaModule):
         elif self.mode == 'nerf':
             coords = self.positional_encoding(coords)
 
+        if self.latent_in > 0:
+            b,n,_ = coords.shape
+            latent = torch.unsqueeze(model_input['partial_latent_vec'],1).repeat(1,n,1)
+            coords = torch.cat((coords, latent), 2)
         output = self.net(coords, get_subdict(params, 'net'))
         return {'model_in': coords_org, 'model_out': output}
 
     def forward_with_activations(self, model_input):
         '''Returns not only model output, but also intermediate activations.'''
         coords = model_input['coords'].clone().detach().requires_grad_(True)
+        if self.latent_in > 0:
+            latent = model_input['partial_embedding']
+            coords = torch.cat((coords, latent), 1)
         activations = self.net.forward_with_activations(coords)
         return {'model_in': coords, 'model_out': activations.popitem(), 'activations': activations}
 
@@ -508,11 +516,11 @@ class PartialConv2d(nn.Conv2d):
 
 
 class PCNEncoder(nn.Module):
-    def __init__(self, latent_dim=256):
+    def __init__(self, latent_dim=256, is_vae=False):
 
         super().__init__()
         self.latent_dim = latent_dim
-        
+        self.is_vae = is_vae        
 
         self.first_conv = nn.Sequential(
             nn.Conv1d(3, 64, 1),
@@ -524,24 +532,28 @@ class PCNEncoder(nn.Module):
             nn.Conv1d(256, 256, 1),
             nn.BatchNorm1d(256),
             nn.ReLU(inplace=True),
-            nn.Conv1d(256, self.latent_dim, 1)
+            nn.Conv1d(256, 128, 1)
         )
+        self.first_linear = nn.Linear(128, self.latent_dim)
+        self.second_linear = nn.Linear(128, self.latent_dim)
+            
 
     def forward(self, xyz):
-        # xyz = xyz[np.newaxis, ...]  # 1 X 500 X 3
-        
-        # with torch.no_grad():
-        xyz = torch.tensor(xyz, dtype=torch.float32).to('cuda:0')
-        # chan ------------------
         B, N, _ = xyz.shape
         
         feature = self.first_conv(xyz.transpose(2, 1))                                       # (B,  256, N)
         feature_global = torch.max(feature, dim=2, keepdim=True)[0]                          # (B,  256, 1)
         feature = torch.cat([feature_global.expand(-1, -1, N), feature], dim=1)              # (B,  512, N)
         feature = self.second_conv(feature)                                                  # (B, 1024, N)
-        feature_global = torch.max(feature,dim=2,keepdim=False)[0]  
+        feature_global = torch.max(feature,dim=2,keepdim=False)[0]
+        mu = self.first_linear(feature_global)
+
+        if self.is_vae:
+            logvar = self.second_linear(feature_global) 
+        else:
+            logvar = None
     
-        return feature_global
+        return mu, logvar
 
 class PartialPCNEncoder(nn.Module):
     def __init__(self, latent_dim=256):
@@ -835,13 +847,20 @@ class PointNetSetAbstractionMsg(nn.Module):
         return new_xyz, new_points_concat
     
 class PointNetPPEncoder(nn.Module):
-    def __init__(self,normal_channel=False):
+    def __init__(self,normal_channel=False, latent_dim=128, is_vae=False):
         super(PointNetPPEncoder, self).__init__()
         in_channel = 3 if normal_channel else 0
+        self.latent_dim = latent_dim
+        self.is_vae = is_vae
         self.normal_channel = normal_channel
-        self.sa1 = PointNetSetAbstractionMsg(512, [0.1, 0.2, 0.4], [16, 32, 128], in_channel,[[32, 32, 64], [64, 64, 128], [64, 96, 128]])
-        self.sa2 = PointNetSetAbstractionMsg(128, [0.2, 0.4, 0.8], [32, 64, 128], 320,[[64, 64, 128], [128, 128, 256], [128, 128, 256]])
-        self.sa3 = PointNetSetAbstraction(None, None, None, 640 + 3, [256, 512, 1024], True)
+        # self.sa1 = PointNetSetAbstractionMsg(512, [0.1, 0.2, 0.4], [16, 32, 128], in_channel,[[32, 32, 64], [64, 64, 128], [64, 96, 128]])
+        self.sa1 = PointNetSetAbstractionMsg(128, [0.1, 0.2, 0.4], [2, 4, 16], in_channel,[[4, 4, 8], [8, 8, 16], [8, 12, 16]])
+        # self.sa2 = PointNetSetAbstractionMsg(128, [0.2, 0.4, 0.8], [32, 64, 128], 320,[[64, 64, 128], [128, 128, 256], [128, 128, 256]])
+        self.sa2 = PointNetSetAbstractionMsg(16, [0.2, 0.4, 0.8], [4, 8, 16], 40,[[8, 8, 16], [16, 16, 32], [16, 16, 32]])
+        # self.sa3 = PointNetSetAbstraction(None, None, None, 640 + 3, [256, 512, 1024], True)
+        self.sa3 = PointNetSetAbstraction(None, None, None, 80 + 3, [32, 64, 128], True)
+        self.first_linear = nn.Linear(128, self.latent_dim)
+        self.second_linear = nn.Linear(128, self.latent_dim)
 
     def forward(self, xyz):
         B, _, _ = xyz.shape
@@ -854,9 +873,17 @@ class PointNetPPEncoder(nn.Module):
         l1_xyz, l1_points = self.sa1(xyz, norm)
         l2_xyz, l2_points = self.sa2(l1_xyz, l1_points)
         l3_xyz, l3_points = self.sa3(l2_xyz, l2_points)
-        x = l3_points.view(B, 1024)
+        # x = l3_points.view(B, 1024)
+        x = l3_points.view(B, 128)
+        mu = self.first_linear(x)
 
-        return x
+        if self.is_vae:
+            logvar = self.second_linear(x) 
+        else:
+            logvar = None
+    
+
+        return mu, logvar
 
 #===========================#
 

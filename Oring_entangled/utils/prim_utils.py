@@ -27,4 +27,7 @@ def delete_prim(prim_path: str) -> None:
     Args:
         prim_path (str): path of the prim in the stage
     """
-    DeletePrimsCommand(paths=[prim_path], destructive=False).do() # chan
+    # DeletePrimsCommand(paths=[prim_path], destructive=False).do() # chan
+    from omni.usd.commands import  DeletePrimsCommand
+
+    DeletePrimsCommand(paths=[prim_path], destructive=True).do() # chan

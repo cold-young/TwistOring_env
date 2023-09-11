@@ -34,7 +34,7 @@ FRANKA_TIP_CFG = SingleArmManipulatorCfg(
     ),
     init_state=SingleArmManipulatorCfg.InitialStateCfg(   # revjoint
         # pos=[0.0, 0.8, -0.3],
-        pos=[-0.1, 1.1, -0.2],
+        pos=[0.12, 1.2, -0.2],
         # rot=[1, 0, 0, 0],  # {action:global} = {x, z}, {y, x}, {z, y}
         rot=[0.70711, 0, 0, -0.70711],  # {action:global} = {x, z}, {y, x}, {z, y}
         

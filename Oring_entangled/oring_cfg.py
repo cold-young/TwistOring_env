@@ -40,36 +40,6 @@ class FrameMarkerCfg:
 class RandomizationCfg:
     """Randomization of scene at reset."""
 
-    # @configclass
-    # class ObjectInitialPoseCfg:
-    #     """Randomization of object initial pose."""
-
-    #     # category
-    #     position_cat: str = "default"  # randomize position: "default", "uniform"
-    #     orientation_cat: str = "default"  # randomize position: "default", "uniform"
-    #     # randomize position
-    #     position_uniform_min = [0.4, -0.25, 0.075]  # position (x,y,z)
-    #     position_uniform_max = [0.6, 0.25, 0.075]  # position (x,y,z)
-
-    # @configclass
-    # class ObjectDesiredPoseCfg:
-    #     """Randomization of object desired pose."""
-
-    #     # category
-    #     position_cat: str = "default"  # randomize position: "default", "uniform"
-    #     orientation_cat: str = "default"  # randomize position: "default", "uniform"
-    #     # randomize position
-    #     position_default = [100.0, 100.0, 100.0]  # position default (x,y,z)
-    #     position_uniform_min = [0.4, -0.25, 0.25]  # position (x,y,z)
-    #     position_uniform_max = [0.6, 0.25, 0.5]  # position (x,y,z)
-    #     # randomize orientation
-    #     orientation_default = [1.0, 0.0, 0.0, 0.0]  # orientation default
-
-    # # initialize
-    # object_initial_pose: ObjectInitialPoseCfg = ObjectInitialPoseCfg()
-    # object_desired_pose: ObjectDesiredPoseCfg = ObjectDesiredPoseCfg()
-
-
 @configclass
 class ObservationsCfg:
     """Observation specifications for the MDP."""
@@ -79,7 +49,7 @@ class ObservationsCfg:
         """Observations for policy group."""
 
         # global group settings
-        enable_corruption: bool = True
+        enable_corruption: bool = False
         # observation terms
         
         # - AGENT
@@ -91,7 +61,7 @@ class ObservationsCfg:
         # - OBJECT
         # -- oring state
 
-        pcn_latent = {"scale": 1.0}
+        pcn_latent = {"scale": 10.0}
         pcn_scale_factor = {"scale": 1.0}
 
 
@@ -110,8 +80,10 @@ class ObservationsCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
     # -- shaped reward
-    penalizing_chamfer_dist_default_and_twist = {"weight": -0.01} # scale 100 ~ 1000
-    # distance_EE_gole_position = {"weight": 0.1} # need to fix
+    # penalizing_chamfer_dist_default_and_twist = {"weight": -0.01} 
+    distance_EE_goal_position = {"weight": 10.0} # need to fix
+    x_deviation_penalty = {"weight": 0.0} # -100.0
+    yaw_acceleration_penalty = {"weight":-0.001}
 
 @configclass
 class TerminationsCfg:
@@ -141,7 +113,7 @@ class OringEnvCfg(IsaacEnvCfg):
     """Configuration for the Lift environment."""
 
     # General Settings
-    env: EnvCfg = EnvCfg(num_envs=2, env_spacing=10, episode_length_s=5.0)
+    env: EnvCfg = EnvCfg(num_envs=2, env_spacing=5, episode_length_s=5.0)
     viewer: ViewerCfg = ViewerCfg(debug_vis=True, eye=(7.5, 7.5, 7.5), lookat=(0.0, 0.0, 0.0))
     # Physics settings
     sim: SimCfg = SimCfg(
